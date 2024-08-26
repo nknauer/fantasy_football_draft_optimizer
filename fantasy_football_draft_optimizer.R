@@ -1,72 +1,130 @@
-# Load necessary libraries
 library(dplyr)
 library(readr)
 library(stringr)
 library(stringi)
+library(tidyverse)
 
-setwd("/Users/nicholas.knauer/Downloads")
-dataset <- read_csv('ADP.csv')
-dataset$Position <- as.character(dataset$Position)
-dataset$Name <- as.character(dataset$Name)
+# Load data
+setwd("/Users/nknauer/Downloads")
+adp_data <- read_csv('adp_2024.csv')
+players_data <- read_csv('players_2024.csv')
+ppr_data <- read_csv('ppr_2024.csv')
+sos_data <- read_csv('FantasyPros_Fantasy_Football_2024_Stength_Of_Schedule.csv')
+
+# Clean and preprocess data
+adp_data$Position <- as.character(adp_data$Position)
+adp_data$Name <- as.character(adp_data$Name)
 
 name_mapping <- c("Travis Etienne" = "Travis Etienne Jr.",
                   "Kenneth Walker" = "Kenneth Walker III",
-                  "Michael Pittman" = "Michael Pittman Jr.")
+                  "Michael Pittman" = "Michael Pittman Jr.",
+                  "Patrick Mahomes" = "Patrick Mahomes II",
+                  "Gardner Minshew" = "Gardner Minshew II")
 
-# Assuming your data frame is called 'df', replace the values in the 'Player' column
-dataset <- dataset %>%
+adp_data <- adp_data %>%
   mutate(Name = recode(Name, !!!name_mapping))
 
-
-players <- read_csv('players.csv')
-players$player <- iconv(players$player, to = "latin1", sub = "")
-players$player <- iconv(players$player, from = "latin1", to = "UTF-8")
-players$player <- gsub("�", "", players$player)
-players <- players %>% filter(grepl("/", player))
-players <- players %>%
+players_data$player <- iconv(players_data$player, to = "latin1", sub = "")
+players_data$player <- iconv(players_data$player, from = "latin1", to = "UTF-8")
+players_data$player <- gsub("�", "", players_data$player)
+players_data <- players_data %>% filter(grepl("/", player))
+players_data <- players_data %>%
   mutate(clean_name = str_extract(player, "^[^/]+"))
-players$clean_name <- str_trim(players$clean_name)
+players_data$clean_name <- str_trim(players_data$clean_name)
 
-ppr <- read_csv('ppr.csv')
+##Clean up Player Data
+players_data$position <- str_extract(players_data$player, "(WR|RB|QB|TE)")
+players_data$fantasy_team <- str_extract(players_data$player, "(?<=-\\s).*")
 
-# Assuming your data frame is called 'df', replace the values in the 'Player' column
-ppr <- ppr %>%
+##players_data <- head(players_data, 10)
+
+count_of_players_drafted <- 
+  players_data %>%
+  filter(fantasy_team == 'Atlanta Falcons') %>%
+  group_by(position) %>%
+  summarize(players_drafted = n())
+
+players_data <- players_data %>%
+  mutate(clean_name = ifelse(clean_name == "Patrick Mahomes", "Patrick Mahomes II", clean_name))
+
+ppr_data <- ppr_data %>%
   mutate(Name = recode(Name, !!!name_mapping))
 
+##Clean SOS Data
+sos_data[,-1] <- lapply(sos_data[,-1], function(x) {
+  as.numeric(gsub(".*(\\d) star matchup.*", "\\1", x))
+})
+
+sos_data <- sos_data %>%
+  pivot_longer(cols = -Team,  # All columns except 'Team'
+               names_to = "Pos",  # Name for the new column that holds the old column names
+               values_to = "SOS")  # Name for the new column that holds the values
 
 
-ppr_and_adp <- left_join(ppr, dataset, by = c("Name" = "Name"))
+# Join data
+ppr_and_adp <- left_join(ppr_data, adp_data, by = c("Name" = "Name"))
 ppr_and_adp <- ppr_and_adp[!is.na(ppr_and_adp$ADP), ]
-
-##Filter for only available players so it can recalculate
+ppr_and_adp <- left_join(ppr_and_adp, sos_data, by = c("Team.y" = "Team", "Position" = "Pos"))
 ppr_and_adp <- ppr_and_adp %>%
-  filter(!(Name %in% players$clean_name))
+  filter(!(Name %in% players_data$clean_name))
 
+ppr_and_adp <- ppr_and_adp %>%
+  filter(!is.na(SOS))
 
+# Calculate position-based statistics
 position_stats <- ppr_and_adp %>% 
   group_by(Position) %>%
   summarize(
     avg_points = mean(`PPR POINTS`, na.rm = TRUE),
-    max_adp_position = max(ADP, na.rm = TRUE)
+    max_adp_position = max(ADP, na.rm = TRUE),
+    std_dev_points = sd(`PPR POINTS`, na.rm = TRUE)
   ) %>%
   ungroup()
 
-ppr_and_adp <- inner_join(ppr_and_adp, position_stats, by = "Position")
-ppr_and_adp$max_points_difference <- max(ppr_and_adp$`PPR POINTS` - ppr_and_adp$avg_points, na.rm = TRUE)
+# Invert the normalization based on your clarified logic
+ppr_and_adp <- ppr_and_adp %>%
+  group_by(Position) %>%
+  mutate(opponent_strength_normalized = (SOS - 1) / 4) %>%
+  ungroup()
 
+
+# Combine data and calculate score
+ppr_and_adp <- inner_join(ppr_and_adp, position_stats, by = "Position")
+ppr_and_adp <- ppr_and_adp %>%
+  group_by(Position) %>%
+  mutate(max_points_difference = max(`PPR POINTS` - avg_points, na.rm = TRUE)) %>%
+  ungroup()
 ppr_and_adp <- ppr_and_adp %>%
   mutate(score = `PPR POINTS` * 
            (1 - ADP/max_adp_position) * 
-           (1 + (`PPR POINTS` - avg_points)/max_points_difference)) %>%
+           (1 + (`PPR POINTS` - avg_points)/max_points_difference) *
+           (1 + (`PPR POINTS` - avg_points)/std_dev_points) *
+           (1 + (ppr_and_adp$ADP - min(ppr_and_adp$ADP))/(max(ppr_and_adp$ADP) - min(ppr_and_adp$ADP))) *
+           (1 + opponent_strength_normalized)) %>%
   arrange(desc(score))
 
-results <- select(ppr_and_adp,Name, Pos, `PPR POINTS`, ADP, avg_points, max_points_difference, score)
+# Add team need factor
+team_need_factors <- c(
+  "QB" = 3,
+  "RB" = 7,
+  "WR" = 7,
+  "TE" = 3,
+  "K" = 1,
+  "D/ST" = 2
+)
 
-##Filter Results By position needed
-#Bench
-#3 RB
-#3 WR
-#1 TE
-results_new <- filter(results, Pos %in% c('WR', 'TE', 'RB', 'QB'))
+ppr_and_adp <- ppr_and_adp %>%
+  mutate(team_need_factor = team_need_factors[Pos])
 
-View(results_new)
+ppr_and_adp <- left_join(ppr_and_adp, count_of_players_drafted, by=c('Position' = 'position')) %>%
+  mutate(players_drafted = coalesce(players_drafted, 0),
+         team_needs = team_need_factor - players_drafted)
+
+ppr_and_adp <- ppr_and_adp %>%
+  mutate(final_score = score * team_needs)
+
+# Filter and display results
+results <- select(ppr_and_adp, Name, Team = Team.y, Pos, `PPR POINTS`, ADP, avg_points, max_points_difference, score, final_score)
+results_new_test <- filter(results, Pos %in% c('WR', 'TE', 'RB', 'QB'))
+results_new_test <- results_new_test %>% arrange(desc(final_score))
+View(results_new_test)
